@@ -1,0 +1,213 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include <errno.h>
+
+#define MAX_EVENTS 64
+#define MESSAGE_SIZE 16
+#define DEFAULT_CLIENT_THREADS 4
+#define LISTEN_BACKLOG 10
+
+char *server_ip = "127.0.0.1";
+int server_port = 12345;
+int num_client_threads = DEFAULT_CLIENT_THREADS;
+int num_requests = 1000000;
+
+/*
+ * Structure to store per-thread data in the client
+ */
+typedef struct {
+    int epoll_fd;
+    int socket_fd;
+    long long total_rtt;
+    long total_messages;
+    float request_rate;
+} client_thread_data_t;
+
+/*
+ * Client thread function: sends messages, waits for responses, and measures RTT
+ */
+void *client_thread_func(void *arg) {
+    client_thread_data_t *data = (client_thread_data_t *)arg;
+    struct epoll_event event, events[MAX_EVENTS];
+    char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP";
+    char recv_buf[MESSAGE_SIZE];
+    struct timeval start, end;
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        return NULL;
+    }
+    data->epoll_fd = epoll_fd;
+
+    event.events = EPOLLIN;
+    event.data.fd = data->socket_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) == -1) {
+        perror("epoll_ctl");
+        return NULL;
+    }
+
+    for (int i = 0; i < num_requests; i++) {
+        gettimeofday(&start, NULL);
+        if (send(data->socket_fd, send_buf, MESSAGE_SIZE, 0) == -1) {
+            perror("send");
+            continue;
+        }
+
+        int event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (event_count == -1) {
+            perror("epoll_wait");
+            break;
+        }
+
+        for (int j = 0; j < event_count; j++) {
+            if (events[j].data.fd == data->socket_fd) {
+                if (recv(data->socket_fd, recv_buf, MESSAGE_SIZE, 0) == -1) {
+                    perror("recv");
+                    continue;
+                }
+                gettimeofday(&end, NULL);
+                long long rtt = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
+                data->total_rtt += rtt;
+                data->total_messages++;
+            }
+        }
+    }
+
+    close(data->socket_fd);
+    close(data->epoll_fd);
+    return NULL;
+}
+
+/*
+ * Function to initialize and run multiple client threads
+ */
+void run_client() {
+    pthread_t threads[num_client_threads];
+    client_thread_data_t thread_data[num_client_threads];
+    struct sockaddr_in server_addr;
+
+    for (int i = 0; i < num_client_threads; i++) {
+        thread_data[i].socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (thread_data[i].socket_fd == -1) {
+            perror("socket");
+            exit(EXIT_FAILURE);
+        }
+
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port);
+        inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+
+        if (connect(thread_data[i].socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+            perror("connect");
+            exit(EXIT_FAILURE);
+        }
+
+        thread_data[i].total_rtt = 0;
+        thread_data[i].total_messages = 0;
+        pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
+    }
+
+    long long total_rtt = 0;
+    long total_messages = 0;
+    for (int i = 0; i < num_client_threads; i++) {
+        pthread_join(threads[i], NULL);
+        total_rtt += thread_data[i].total_rtt;
+        total_messages += thread_data[i].total_messages;
+    }
+
+    printf("Average RTT: %lld us\n", total_messages ? total_rtt / total_messages : 0);
+    printf("Total Request Rate: %f messages/s\n", total_messages / (total_rtt / 1e6));
+}
+
+/*
+ * Function to handle incoming connections on the server
+ */
+void run_server() {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        perror("bind");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(listen_fd, LISTEN_BACKLOG) == -1) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event event, events[MAX_EVENTS];
+    event.events = EPOLLIN;
+    event.data.fd = listen_fd;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
+        perror("epoll_ctl");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server is running on port %d\n", server_port);
+    while (1) {
+        int event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (event_count == -1) {
+            perror("epoll_wait");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < event_count; i++) {
+            if (events[i].data.fd == listen_fd) {
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd == -1) {
+                    perror("accept");
+                    continue;
+                }
+
+                event.events = EPOLLIN;
+                event.data.fd = client_fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+            } else {
+                char buffer[MESSAGE_SIZE];
+                int bytes_read = recv(events[i].data.fd, buffer, MESSAGE_SIZE, 0);
+                if (bytes_read <= 0) {
+                    close(events[i].data.fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
+                } else {
+                    send(events[i].data.fd, buffer, MESSAGE_SIZE, 0);
+                }
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "server") == 0) {
+        run_server();
+    } else if (argc > 1 && strcmp(argv[1], "client") == 0) {
+        run_client();
+    } else {
+        printf("Usage: %s <server|client> [server_ip server_port num_client_threads num_requests]\n", argv[0]);
+    }
+    return 0;
+}
