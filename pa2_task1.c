@@ -5,10 +5,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-
+#include <pthread.h>
+#include <errno.h>
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
 
