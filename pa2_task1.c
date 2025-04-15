@@ -1,5 +1,5 @@
 // pa2_task1.c
-
+//Generative AI: CHATGPT was used to clean up code, and catch mistakes, as well as verify the work met rubric Criteria
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
